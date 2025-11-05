@@ -5,15 +5,251 @@ Comprehensive health assessment for NavIC satellites including drift analysis
 
 import numpy as np
 import pandas as pd
+from datetime import timedelta
 from config import NAVIK_SERVICE_REQUIREMENTS
 from drift_analysis import assess_drift_health, calculate_drift_trend
 from maneuver_detection import calculate_maneuver_uniformity
 
 
+def analyze_maneuver_pattern(maneuver_events, observation_start, observation_end):
+    """
+    Dynamically analyze the maneuver pattern for a satellite.
+    Analyzes E-W and N-S maneuvers separately as they serve different purposes.
+    
+    Args:
+        maneuver_events: DataFrame of detected maneuvers with 'EPOCH', 'EW_MANEUVER', 'NS_MANEUVER' columns
+        observation_start: Start date of observation period
+        observation_end: End date of observation period
+    
+    Returns:
+        dict: Pattern analysis including expected interval, last maneuver, and health metrics
+    """
+    if len(maneuver_events) == 0:
+        return {
+            'num_maneuvers': 0,
+            'num_ew_maneuvers': 0,
+            'num_ns_maneuvers': 0,
+            'expected_interval_days': None,
+            'ew_expected_interval_days': None,
+            'ns_expected_interval_days': None,
+            'median_interval_days': None,
+            'last_maneuver_date': None,
+            'last_ew_maneuver_date': None,
+            'last_ns_maneuver_date': None,
+            'days_since_last_maneuver': None,
+            'days_since_last_ew': None,
+            'days_since_last_ns': None,
+            'is_overdue': False,
+            'ew_is_overdue': False,
+            'ns_is_overdue': False,
+            'pattern_confidence': 'none',
+            'maintenance_score': 0,
+            'maintenance_status': 'No maneuvers detected'
+        }
+    
+    # Separate E-W and N-S maneuvers
+    ew_maneuvers = maneuver_events[maneuver_events.get('EW_MANEUVER', False) == True].copy() if 'EW_MANEUVER' in maneuver_events.columns else pd.DataFrame()
+    ns_maneuvers = maneuver_events[maneuver_events.get('NS_MANEUVER', False) == True].copy() if 'NS_MANEUVER' in maneuver_events.columns else pd.DataFrame()
+    
+    num_ew = len(ew_maneuvers)
+    num_ns = len(ns_maneuvers)
+    
+    # Helper function to analyze pattern for a specific maneuver type
+    def analyze_type_pattern(maneuvers_df, maneuver_type_name):
+        if len(maneuvers_df) == 0:
+            return None, None, None, None, 'none'
+        
+        dates = pd.to_datetime(maneuvers_df['EPOCH']).sort_values().tolist()
+        intervals = []
+        if len(dates) >= 2:
+            for i in range(1, len(dates)):
+                intervals.append((dates[i] - dates[i-1]).days)
+        
+        if len(intervals) >= 2:
+            median_int = np.median(intervals)
+            mean_int = np.mean(intervals)
+            std_int = np.std(intervals)
+            expected_int = median_int
+            if std_int / mean_int < 0.3:
+                confidence = 'high'
+            elif std_int / mean_int < 0.6:
+                confidence = 'medium'
+            else:
+                confidence = 'low'
+        elif len(intervals) == 1:
+            expected_int = intervals[0]
+            confidence = 'low'
+        else:
+            obs_days = (observation_end - observation_start).days
+            expected_int = obs_days
+            confidence = 'very_low'
+        
+        last_date = dates[-1]
+        days_since = (observation_end - last_date).days
+        is_overdue = days_since > (expected_int * 1.5)
+        
+        return expected_int, last_date, days_since, is_overdue, confidence
+    
+    # Analyze E-W pattern
+    ew_expected, ew_last_date, ew_days_since, ew_overdue, ew_confidence = analyze_type_pattern(ew_maneuvers, "E-W")
+    
+    # Analyze N-S pattern
+    ns_expected, ns_last_date, ns_days_since, ns_overdue, ns_confidence = analyze_type_pattern(ns_maneuvers, "N-S")
+    
+    # Overall pattern analysis (all maneuvers)
+    maneuver_dates = pd.to_datetime(maneuver_events['EPOCH']).sort_values().tolist()
+    num_maneuvers = len(maneuver_dates)
+    
+    intervals_days = []
+    if num_maneuvers >= 2:
+        for i in range(1, num_maneuvers):
+            intervals_days.append((maneuver_dates[i] - maneuver_dates[i-1]).days)
+    
+    if len(intervals_days) >= 2:
+        median_interval = np.median(intervals_days)
+        mean_interval = np.mean(intervals_days)
+        std_interval = np.std(intervals_days)
+        expected_interval_days = median_interval
+        if std_interval / mean_interval < 0.3:
+            pattern_confidence = 'high'
+        elif std_interval / mean_interval < 0.6:
+            pattern_confidence = 'medium'
+        else:
+            pattern_confidence = 'low'
+    elif len(intervals_days) == 1:
+        expected_interval_days = intervals_days[0]
+        median_interval = intervals_days[0]
+        pattern_confidence = 'low'
+    else:
+        observation_days = (observation_end - observation_start).days
+        expected_interval_days = observation_days
+        median_interval = observation_days
+        pattern_confidence = 'very_low'
+    
+    last_maneuver_date = maneuver_dates[-1]
+    days_since_last = (observation_end - last_maneuver_date).days
+    is_overdue = days_since_last > (expected_interval_days * 1.5)
+    
+    # Calculate combined maintenance score
+    ew_score = 100
+    ns_score = 100
+    
+    # E-W score (60% weight - more critical for station-keeping)
+    if ew_expected is not None:
+        if ew_overdue:
+            overdue_ratio = ew_days_since / ew_expected
+            if overdue_ratio > 3.0:
+                ew_score = 0
+            elif overdue_ratio > 2.0:
+                ew_score = 30
+            else:
+                ew_score = 60
+        else:
+            recency_ratio = ew_days_since / ew_expected
+            if recency_ratio < 0.5:
+                ew_score = 100
+            elif recency_ratio < 1.0:
+                ew_score = 100
+            else:
+                ew_score = 90
+        
+        # Adjust for confidence
+        if ew_confidence == 'very_low':
+            ew_score = max(50, ew_score * 0.7)
+        elif ew_confidence == 'low':
+            ew_score = max(60, ew_score * 0.85)
+    else:
+        ew_score = 50  # No E-W maneuvers detected
+    
+    # N-S score (40% weight - less frequent but still important)
+    if ns_expected is not None:
+        if ns_overdue:
+            overdue_ratio = ns_days_since / ns_expected
+            if overdue_ratio > 3.0:
+                ns_score = 0
+            elif overdue_ratio > 2.0:
+                ns_score = 30
+            else:
+                ns_score = 60
+        else:
+            recency_ratio = ns_days_since / ns_expected
+            if recency_ratio < 0.5:
+                ns_score = 100
+            elif recency_ratio < 1.0:
+                ns_score = 100
+            else:
+                ns_score = 90
+        
+        # Adjust for confidence
+        if ns_confidence == 'very_low':
+            ns_score = max(50, ns_score * 0.7)
+        elif ns_confidence == 'low':
+            ns_score = max(60, ns_score * 0.85)
+    else:
+        ns_score = 70  # No N-S maneuvers (less critical)
+    
+    # Combined maintenance score (weighted)
+    maintenance_score = (ew_score * 0.6) + (ns_score * 0.4)
+    
+    # Build maintenance status message
+    status_parts = []
+    if ew_expected is not None:
+        if ew_overdue:
+            status_parts.append(f"E-W: OVERDUE ({ew_days_since} days, expected every {ew_expected:.0f} days)")
+        else:
+            status_parts.append(f"E-W: On schedule ({ew_days_since} days ago, every {ew_expected:.0f} days)")
+    else:
+        status_parts.append("E-W: No maneuvers detected")
+    
+    if ns_expected is not None:
+        if ns_overdue:
+            status_parts.append(f"N-S: OVERDUE ({ns_days_since} days, expected every {ns_expected:.0f} days)")
+        else:
+            status_parts.append(f"N-S: On schedule ({ns_days_since} days ago, every {ns_expected:.0f} days)")
+    else:
+        status_parts.append("N-S: No maneuvers detected")
+    
+    maintenance_status = " | ".join(status_parts)
+    
+    return {
+        'num_maneuvers': num_maneuvers,
+        'num_ew_maneuvers': num_ew,
+        'num_ns_maneuvers': num_ns,
+        'expected_interval_days': expected_interval_days,
+        'ew_expected_interval_days': ew_expected,
+        'ns_expected_interval_days': ns_expected,
+        'median_interval_days': median_interval if len(intervals_days) > 0 else None,
+        'last_maneuver_date': last_maneuver_date,
+        'last_ew_maneuver_date': ew_last_date,
+        'last_ns_maneuver_date': ns_last_date,
+        'days_since_last_maneuver': days_since_last,
+        'days_since_last_ew': ew_days_since,
+        'days_since_last_ns': ns_days_since,
+        'is_overdue': is_overdue,
+        'ew_is_overdue': ew_overdue,
+        'ns_is_overdue': ns_overdue,
+        'pattern_confidence': pattern_confidence,
+        'ew_confidence': ew_confidence,
+        'ns_confidence': ns_confidence,
+        'ew_score': ew_score,
+        'ns_score': ns_score,
+        'maintenance_score': maintenance_score,
+        'maintenance_status': maintenance_status,
+        'intervals': intervals_days if len(intervals_days) > 0 else None
+    }
+
+
 def assess_satellite_health_with_drift(sat_name, sat_df, maneuver_events, inc_tolerance, 
                                        min_man_per_month, max_man_per_month, uniformity_threshold,
-                                       drift_tolerance_gso=0.05, service_requirements=None):
-    """Comprehensive health assessment for a satellite including drift analysis."""
+                                       drift_tolerance_gso=0.05, service_requirements=None,
+                                       pattern_maneuvers=None, pattern_df=None):
+    """
+    Comprehensive health assessment for a satellite including drift analysis.
+    
+    Args:
+        pattern_maneuvers: Maneuvers from last year's data for pattern analysis (optional)
+        pattern_df: Last year's dataframe for pattern analysis (optional)
+    """
     requirements_map = service_requirements if service_requirements is not None else NAVIK_SERVICE_REQUIREMENTS
     requirements = requirements_map.get(sat_name, {})
     
@@ -39,7 +275,9 @@ def assess_satellite_health_with_drift(sat_name, sat_df, maneuver_events, inc_to
     else:
         sat_type = 'Unclassified'
     
-    observation_days = (sat_df['EPOCH'].max() - sat_df['EPOCH'].min()).days
+    observation_start = sat_df['EPOCH'].min()
+    observation_end = sat_df['EPOCH'].max()
+    observation_days = (observation_end - observation_start).days
     observation_months = observation_days / 30.0
     
     num_maneuvers = len(maneuver_events)
@@ -60,39 +298,22 @@ def assess_satellite_health_with_drift(sat_name, sat_df, maneuver_events, inc_to
         inc_score = None
         inc_deviation = None
     
-    # Maintenance score with better scaling
-    # QZSS has different maintenance cadence (every 6 months) vs NavIC (monthly)
-    if is_qzss:
-        # For QZSS IGSO: expect ~0.17 maneuvers/month (1 every 6 months)
-        # For QZSS GSO: more frequent maneuvers are normal due to station-keeping requirements
-        if sat_type == 'GSO':
-            # GSO satellites need more frequent corrections
-            qzss_min = 0.1  # At least 1 maneuver every 10 months
-            qzss_max = 2.0  # GSO can have up to ~2 maneuvers/month normally
-        else:
-            # IGSO satellites (standard QZSS cadence)
-            qzss_min = 0.1  # At least 1 maneuver every 10 months
-            qzss_max = 0.5  # More than 1 every 2 months might indicate issues
-        
-        if maneuvers_per_month < qzss_min:
-            maintenance_score = max(0, 30 + (maneuvers_per_month / qzss_min) * 40)
-        elif maneuvers_per_month > qzss_max:
-            excess_maneuvers = maneuvers_per_month - qzss_max
-            penalty = min(40, excess_maneuvers / qzss_max * 60)
-            maintenance_score = 100 - penalty
-        else:
-            maintenance_score = 100
+    # ========== DYNAMIC MANEUVER PATTERN ANALYSIS ==========
+    # Use last year's data for pattern analysis if available, otherwise use selected range
+    if pattern_maneuvers is not None and pattern_df is not None:
+        pattern_obs_start = pattern_df['EPOCH'].min()
+        pattern_obs_end = pattern_df['EPOCH'].max()
+        pattern_analysis = analyze_maneuver_pattern(pattern_maneuvers, pattern_obs_start, pattern_obs_end)
     else:
-        # NavIC maintenance scoring (original logic)
-        if maneuvers_per_month < min_man_per_month:
-            maintenance_score = max(0, 30 + (maneuvers_per_month / min_man_per_month) * 40)
-        elif maneuvers_per_month > max_man_per_month:
-            # Penalize excessive maneuvers (potential issues)
-            excess_maneuvers = maneuvers_per_month - max_man_per_month
-            penalty = min(40, excess_maneuvers / max_man_per_month * 60)
-            maintenance_score = 100 - penalty
-        else:
-            maintenance_score = 100
+        # Fallback to selected range if pattern data not available
+        pattern_analysis = analyze_maneuver_pattern(maneuver_events, observation_start, observation_end)
+    
+    # Use the dynamically determined maintenance score
+    maintenance_score = pattern_analysis['maintenance_score']
+    maintenance_status = pattern_analysis['maintenance_status']
+    expected_interval_days = pattern_analysis['expected_interval_days']
+    days_since_last = pattern_analysis['days_since_last_maneuver']
+    pattern_confidence = pattern_analysis['pattern_confidence']
     
     # Uniformity score with better weighting
     if num_maneuvers >= 2:
@@ -230,35 +451,46 @@ def assess_satellite_health_with_drift(sat_name, sat_df, maneuver_events, inc_to
             elif std_drift > drift_tolerance_gso * 0.5:
                 remarks.append(f"Moderate drift variability (std dev: {std_drift:.3f}°/day)")
     
-    # Maintenance remarks - adjusted for QZSS vs NavIC
-    if is_qzss:
-        # QZSS: Different thresholds for GSO vs IGSO
-        if sat_type == 'GSO':
-            # GSO satellites need more frequent station-keeping
-            if maneuvers_per_month < 0.1:
-                remarks.append(f"⚠️ Low maintenance activity ({maneuvers_per_month:.2f}/month, ~{maneuvers_per_month*12:.1f}/year)")
-            elif maneuvers_per_month > 2.0:
-                remarks.append(f"⚠️ Very high correction frequency ({maneuvers_per_month:.2f}/month, ~{maneuvers_per_month*12:.1f}/year)")
-            else:
-                # Normal for QZSS GSO
-                remarks.append(f"Active station-keeping ({maneuvers_per_month:.2f}/month, ~{maneuvers_per_month*12:.1f}/year)")
-        else:
-            # IGSO satellites: ~1 maneuver every 6 months is normal
-            if maneuvers_per_month < 0.1:
-                remarks.append(f"⚠️ Low maintenance activity ({maneuvers_per_month:.2f}/month, ~{maneuvers_per_month*12:.1f}/year)")
-            elif maneuvers_per_month > 0.5:
-                remarks.append(f"⚠️ High correction frequency ({maneuvers_per_month:.2f}/month, ~{maneuvers_per_month*12:.1f}/year)")
-            else:
-                # Normal for QZSS IGSO
-                remarks.append(f"Normal maintenance cadence ({maneuvers_per_month:.2f}/month, ~{maneuvers_per_month*12:.1f}/year)")
-    else:
-        # NavIC maintenance remarks (original logic)
-        if maneuvers_per_month < min_man_per_month:
-            remarks.append(f"⚠️ Low maintenance activity ({maneuvers_per_month:.1f}/month)")
-        elif maneuvers_per_month > max_man_per_month:
-            remarks.append(f"⚠️ High correction frequency ({maneuvers_per_month:.1f}/month)")
-        else:
-            remarks.append(f"Active maintenance ({maneuvers_per_month:.1f} maneuvers/month)")
+    # Dynamic maintenance remarks based on learned pattern (E-W and N-S separate)
+    remarks.append(f"📊 {maintenance_status}")
+    
+    # E-W specific remarks
+    ew_expected = pattern_analysis.get('ew_expected_interval_days')
+    ew_days_since = pattern_analysis.get('days_since_last_ew')
+    ew_confidence = pattern_analysis.get('ew_confidence')
+    ew_overdue = pattern_analysis.get('ew_is_overdue')
+    
+    if ew_expected is not None:
+        if ew_confidence == 'high':
+            remarks.append(f"✅ E-W: Consistent pattern (every {ew_expected:.0f} days)")
+        elif ew_confidence in ['medium', 'low']:
+            remarks.append(f"ℹ️ E-W: Variable pattern (confidence: {ew_confidence})")
+        
+        if ew_overdue:
+            remarks.append(f"🔴 E-W maneuver overdue by {ew_days_since - ew_expected:.0f} days")
+        elif ew_days_since is not None:
+            next_ew = ew_expected - ew_days_since
+            if next_ew > 0:
+                remarks.append(f"⏱️ Next E-W maneuver expected in ~{next_ew:.0f} days")
+    
+    # N-S specific remarks
+    ns_expected = pattern_analysis.get('ns_expected_interval_days')
+    ns_days_since = pattern_analysis.get('days_since_last_ns')
+    ns_confidence = pattern_analysis.get('ns_confidence')
+    ns_overdue = pattern_analysis.get('ns_is_overdue')
+    
+    if ns_expected is not None:
+        if ns_confidence == 'high':
+            remarks.append(f"✅ N-S: Consistent pattern (every {ns_expected:.0f} days)")
+        elif ns_confidence in ['medium', 'low']:
+            remarks.append(f"ℹ️ N-S: Variable pattern (confidence: {ns_confidence})")
+        
+        if ns_overdue:
+            remarks.append(f"🔴 N-S maneuver overdue by {ns_days_since - ns_expected:.0f} days")
+        elif ns_days_since is not None:
+            next_ns = ns_expected - ns_days_since
+            if next_ns > 0:
+                remarks.append(f"⏱️ Next N-S maneuver expected in ~{next_ns:.0f} days")
     
     # Uniformity remarks
     if uniformity_cov is not None:
@@ -270,6 +502,19 @@ def assess_satellite_health_with_drift(sat_name, sat_df, maneuver_events, inc_to
     if std_inclination < 0.1:
         remarks.append("Stable orbital parameters")
     
+    # Get current altitude if available
+    current_altitude = None
+    if 'altitude_km' in sat_df.columns and not sat_df['altitude_km'].isna().all():
+        current_altitude = sat_df['altitude_km'].iloc[-1]
+    
+    # Extract pattern details for display
+    ew_expected = pattern_analysis.get('ew_expected_interval_days')
+    ns_expected = pattern_analysis.get('ns_expected_interval_days')
+    ew_days_since = pattern_analysis.get('days_since_last_ew')
+    ns_days_since = pattern_analysis.get('days_since_last_ns')
+    ew_confidence = pattern_analysis.get('ew_confidence', 'none')
+    ns_confidence = pattern_analysis.get('ns_confidence', 'none')
+    
     return {
         'Satellite': sat_name,
         'Type': sat_type,
@@ -278,12 +523,23 @@ def assess_satellite_health_with_drift(sat_name, sat_df, maneuver_events, inc_to
         'Target Incl. (°)': target_inclination if target_inclination is not None else "N/A",
         'Mean Incl. (°)': round(mean_inclination, 3),
         'Incl. Dev. (°)': round(inc_deviation, 3) if inc_deviation is not None else "N/A",
+        'Altitude (km)': round(current_altitude, 1) if current_altitude is not None else "N/A",
         'Mean Drift (°/day)': round(mean_drift, 4) if mean_drift is not None else "N/A",
         'Current Drift (°/day)': round(current_drift, 4) if current_drift is not None else "N/A",
         'Drift Status': f"{drift_color} {drift_status}",
         'Maneuvers/Month': round(maneuvers_per_month, 2),
+        'Expected Interval (days)': round(expected_interval_days, 0) if expected_interval_days is not None else "N/A",
+        'Days Since Last': days_since_last if days_since_last is not None else "N/A",
+        'Pattern Confidence': pattern_confidence.replace('_', ' ').title(),
         'EW Maneuvers': int(maneuver_events['EW_MANEUVER'].sum()) if 'EW_MANEUVER' in maneuver_events.columns else 0,
         'NS Maneuvers': int(maneuver_events['NS_MANEUVER'].sum()) if 'NS_MANEUVER' in maneuver_events.columns else 0,
+        'EW Expected Interval (days)': round(ew_expected, 0) if ew_expected is not None else "N/A",
+        'NS Expected Interval (days)': round(ns_expected, 0) if ns_expected is not None else "N/A",
+        'EW Days Since Last': ew_days_since if ew_days_since is not None else "N/A",
+        'NS Days Since Last': ns_days_since if ns_days_since is not None else "N/A",
+        'EW Pattern Confidence': ew_confidence.replace('_', ' ').title(),
+        'NS Pattern Confidence': ns_confidence.replace('_', ' ').title(),
         'Uniformity (CoV)': round(uniformity_cov, 3) if uniformity_cov else "N/A",
-        'Remarks': " | ".join(remarks)
+        'Remarks': " | ".join(remarks),
+        'Pattern Analysis Period': f"{pattern_obs_start.strftime('%Y-%m-%d')} to {pattern_obs_end.strftime('%Y-%m-%d')}" if pattern_maneuvers is not None else "Selected date range"
     }

@@ -5,8 +5,7 @@ Streamlit-based interface for satellite monitoring and analysis
 
 import streamlit as st
 import pandas as pd
-from datetime import date, datetime
-from datetime import timezone
+from datetime import date, datetime, timedelta, timezone
 from skyfield.api import load
 
 # Import our modular components
@@ -22,13 +21,96 @@ from health_assessment import assess_satellite_health_with_drift
 from dop_calculations import parse_tle_data, calculate_dop_for_location, get_dop_quality
 from visualization import (
     plot_individual_satellites, plot_combined_drift, plot_bounding_boxes,
-    plot_sky_plot, plot_dop_over_time, plot_combined_inclination,
+    plot_sky_plot, plot_animated_sky_plot, plot_dop_over_time, plot_combined_inclination,
     plot_combined_altitude, plot_drift_distribution, plot_drift_vs_altitude,
     plot_constellation_coverage
 )
 
 # Initialize timescale globally
 ts = load.timescale()
+
+
+def check_graveyard_orbit_satellites(df_all):
+    """
+    Check for satellites that may have been moved to graveyard orbit.
+    Prints warnings to terminal for all satellites with abnormally high altitudes.
+    
+    Args:
+        df_all: DataFrame containing satellite orbital data
+    """
+    from config import GEO_NOMINAL_ALTITUDE, GEO_ALTITUDE_TOLERANCE, GRAVEYARD_ORBIT_MIN
+    
+    print("\n" + "="*80)
+    print("🛰️  GRAVEYARD ORBIT DETECTION - SATELLITE STATUS CHECK")
+    print("="*80)
+    
+    for sat_name in sorted(df_all['satellite'].unique()):
+        sat_df = df_all[df_all['satellite'] == sat_name].copy()
+        
+        # Check if satellite has altitude data
+        if 'altitude_km' not in sat_df.columns or sat_df['altitude_km'].isna().all():
+            print(f"\n📡 {sat_name}")
+            print(f"   ⚠️  No altitude data available")
+            continue
+        
+        # Get mean inclination to determine satellite type
+        mean_incl = sat_df['INCLINATION'].mean()
+        
+        # Determine satellite type
+        if mean_incl < 10.0:
+            sat_type = "GSO"
+        else:
+            sat_type = "IGSO"
+        
+        # Get recent altitude (last 10% of data points)
+        recent_data = sat_df.tail(max(1, len(sat_df) // 10))
+        recent_altitude = recent_data['altitude_km'].mean()
+        max_altitude = sat_df['altitude_km'].max()
+        min_altitude = sat_df['altitude_km'].min()
+        current_altitude = sat_df['altitude_km'].iloc[-1]
+        
+        # Calculate deviation from nominal GEO altitude
+        altitude_deviation = current_altitude - GEO_NOMINAL_ALTITUDE
+        
+        # Determine status
+        status = "✅ OPERATIONAL"
+        details = []
+        
+        # Check for graveyard orbit (applies to both GSO and IGSO)
+        if current_altitude >= GRAVEYARD_ORBIT_MIN:
+            status = "💀 GRAVEYARD ORBIT (DEAD)"
+            details.append(f"Current altitude ({current_altitude:.1f} km) is in graveyard orbit zone (>{GRAVEYARD_ORBIT_MIN:.1f} km)")
+            details.append(f"Satellite has been raised {altitude_deviation:.1f} km above nominal GEO altitude")
+        elif sat_type == "GSO" and abs(altitude_deviation) > GEO_ALTITUDE_TOLERANCE:
+            # For GSO satellites, check if they're within operational tolerance
+            if altitude_deviation > 0:
+                status = "⚠️  ELEVATED ORBIT (POSSIBLY DECOMMISSIONED)"
+                details.append(f"Altitude {altitude_deviation:.1f} km above nominal GEO ({GEO_NOMINAL_ALTITUDE:.1f} km)")
+            else:
+                status = "⚠️  LOW ORBIT (ANOMALOUS)"
+                details.append(f"Altitude {abs(altitude_deviation):.1f} km below nominal GEO ({GEO_NOMINAL_ALTITUDE:.1f} km)")
+        elif sat_type == "IGSO":
+            # For IGSO satellites, just note their altitude (they have elliptical orbits)
+            details.append(f"IGSO satellite with elliptical orbit (altitude varies)")
+        
+        # Print satellite status
+        print(f"\n📡 {sat_name}")
+        print(f"   Status: {status}")
+        print(f"   Type: {sat_type} (Inclination: {mean_incl:.2f}°)")
+        print(f"   Current Altitude: {current_altitude:.2f} km")
+        print(f"   Recent Avg Altitude: {recent_altitude:.2f} km")
+        print(f"   Altitude Range: {min_altitude:.2f} - {max_altitude:.2f} km")
+        print(f"   Deviation from GEO: {altitude_deviation:+.2f} km")
+        
+        if details:
+            print(f"   ℹ️  NOTES:")
+            for detail in details:
+                print(f"      - {detail}")
+    
+    print("\n" + "="*80)
+    print("📊 GRAVEYARD ORBIT CHECK COMPLETE")
+    print("="*80 + "\n")
+
 
 # Streamlit Configuration
 st.set_page_config(page_title="GNSS Health Monitor", layout="wide")
@@ -177,6 +259,9 @@ if st.button("🚀 Fetch Data & Run Analysis", type="primary"):
                 st.session_state['analysis_complete'] = True
                 st.session_state['errors'] = errors
                 
+                # Check for graveyard orbit satellites
+                check_graveyard_orbit_satellites(df_all)
+                
                 st.success("✅ Data fetched successfully! Scroll down to see results.")
 
 # ==================== RESULTS DISPLAY ====================
@@ -191,6 +276,52 @@ if st.session_state.get('analysis_complete', False):
     maneuver_summary = []
     all_maneuvers_df = pd.DataFrame()
     health_assessments = []
+    
+    # Fetch last year's data for pattern analysis (regardless of user's date range)
+    from datetime import datetime, timezone
+    pattern_end_date = datetime.now(timezone.utc)
+    pattern_start_date = pattern_end_date - timedelta(days=365)
+    pattern_start_str = pattern_start_date.strftime("%Y-%m-%d")
+    pattern_end_str = pattern_end_date.strftime("%Y-%m-%d")
+    
+    st.info(f"ℹ️ Fetching last year's data ({pattern_start_str} to {pattern_end_str}) for maneuver pattern analysis...")
+    
+    # Fetch pattern data for all satellites
+    pattern_data = {}
+    for sat_name, norad in SAT_DICT.items():
+        try:
+            if norad is None:
+                continue
+            pattern_df = fetch_and_classify_satellite(
+                norad_id=int(norad),
+                start_date=pattern_start_str,
+                end_date=pattern_end_str,
+                username=username,
+                password=password,
+                igso_min=10,
+                deviation_tol=0.3
+            )
+            pattern_df['EPOCH'] = pd.to_datetime(pattern_df['EPOCH'])
+            pattern_df = pattern_df.sort_values('EPOCH').reset_index(drop=True)
+            
+            # Detect maneuvers in pattern data
+            pattern_detected = detect_navik_maneuvers(
+                pattern_df,
+                sma_col='SEMIMAJOR_AXIS',
+                inc_col='INCLINATION',
+                z_thresh=z_threshold,
+                sma_abs_thresh_km=sma_threshold,
+                inc_abs_thresh_deg=inc_threshold,
+                persist_window=int(persist_window)
+            )
+            pattern_maneuvers = pattern_detected[pattern_detected['MANEUVER']].copy()
+            pattern_data[sat_name] = {
+                'df': pattern_df,
+                'maneuvers': pattern_maneuvers
+            }
+        except Exception as e:
+            st.warning(f"Could not fetch pattern data for {sat_name}: {str(e)}")
+            pattern_data[sat_name] = None
     
     for sat_name in sorted(df_all['satellite'].unique()):
         sat_df = df_all[df_all['satellite'] == sat_name].copy()
@@ -220,32 +351,137 @@ if st.session_state.get('analysis_complete', False):
             'Observation Period (days)': (sat_df['EPOCH'].max() - sat_df['EPOCH'].min()).days
         })
         
+        # Use last year's data for health assessment if available, otherwise use selected range
+        if pattern_data.get(sat_name) is not None:
+            # Use last year's data for ALL health assessment
+            health_sat_df = pattern_data[sat_name]['df']
+            health_maneuvers = pattern_data[sat_name]['maneuvers']
+        else:
+            # Fallback to selected range if pattern data not available
+            health_sat_df = sat_df
+            health_maneuvers = maneuver_events
+        
         health_data = assess_satellite_health_with_drift(
-            sat_name, sat_df, maneuver_events,
+            sat_name, health_sat_df, health_maneuvers,
             inclination_tolerance, min_maneuvers_per_month,
             max_maneuvers_per_month, maneuver_uniformity_threshold,
-            drift_tolerance_gso, service_requirements=SERVICE_REQS
+            drift_tolerance_gso, service_requirements=SERVICE_REQS,
+            pattern_maneuvers=health_maneuvers,
+            pattern_df=health_sat_df
         )
         health_assessments.append(health_data)
     
     health_df = pd.DataFrame(health_assessments)
     
+    # Add health scoring logic explanation
+    with st.expander("ℹ️ Health Status Scoring Logic (Dynamic Pattern Analysis)", expanded=False):
+        st.markdown("""
+        ### 🏥 Health Status Determination
+        
+        The **Overall Score** (0-100) is calculated using weighted components:
+        
+        #### 📊 Score Components:
+        - **Inclination Score (35%)**: Deviation from target inclination
+          - Penalty for deviation from target
+          - Additional penalty for unstable inclination (high std deviation)
+        
+        - **Maintenance Score (25%)**: **🆕 Dynamic Pattern-Based Assessment**
+          - **Individual Learning**: Each satellite's maneuver pattern is analyzed from historical data
+          - **Pattern Detection**: Calculates median interval between maneuvers (e.g., 30 days, 60 days, etc.)
+          - **Adaptive Scoring**: 
+            - ✅ **On Schedule**: Last maneuver within expected window → Score: 100
+            - ⏱️ **Due Soon**: Approaching next window (1.0-1.5x interval) → Score: 90
+            - ⚠️ **Overdue**: Beyond 1.5x expected interval → Score: 60
+            - 🔴 **Critical**: Beyond 2x expected interval → Score: 30
+            - 💀 **Severe**: Beyond 3x expected interval → Score: 0
+          - **Confidence Weighting**: Score adjusted based on pattern consistency
+        
+        - **Drift Score (25%)**: Longitudinal drift analysis
+          - GSO satellites: Should maintain minimal drift (<0.05°/day)
+          - IGSO satellites: Higher drift tolerance (up to 2°/day normal)
+          - Penalties for unstable drift patterns
+        
+        - **Uniformity Score (15%)**: Maneuver spacing regularity
+          - Regular spacing → Better planning and control
+          - Irregular spacing → Reactive corrections
+        
+        #### 🎯 Health Status Thresholds:
+        - **🟢 Healthy**: Score ≥ 80
+        - **🟡 Fair**: Score 60-79
+        - **🟠 Degraded**: Score 40-59
+        - **🔴 Critical**: Score < 40
+        
+        #### 🔍 Dynamic Pattern Analysis Features:
+        - **No Hard-Coded Intervals**: Each satellite defines its own correction cadence
+        - **Pattern Confidence**: High/Medium/Low based on consistency of historical intervals
+        - **Predictive Alerts**: Estimates when next maneuver is expected
+        - **Overdue Detection**: Flags satellites missing their expected correction window
+        - **Adaptive to Changes**: Automatically adjusts to new operational patterns
+        
+        #### 📈 Additional Factors:
+        - Drift trend analysis (increasing/decreasing)
+        - Altitude monitoring (graveyard orbit detection)
+        - Maneuver type distribution (EW vs NS)
+        - Orbital stability metrics
+        """)
+    
     st.dataframe(
         health_df[[
             'Satellite', 'Type', 'Health Status', 'Overall Score', 
             'Target Incl. (°)', 'Mean Incl. (°)', 'Incl. Dev. (°)',
-            'Mean Drift (°/day)', 'Drift Status',
-            'Maneuvers/Month', 'EW Maneuvers', 'NS Maneuvers'
+            'Altitude (km)', 'Mean Drift (°/day)', 'Drift Status'
         ]],
         hide_index=True,
-        use_container_width=True
+        width='stretch',
+        column_config={
+            "Health Status": st.column_config.TextColumn(
+                "Health Status",
+                help="🟢 Healthy (≥80) | 🟡 Fair (60-79) | 🟠 Degraded (40-59) | 🔴 Critical (<40)",
+                width="medium"
+            ),
+            "Overall Score": st.column_config.NumberColumn(
+                "Overall Score",
+                help="Weighted score: Inclination (35%) + Maintenance (25%) + Drift (25%) + Uniformity (15%)",
+                format="%.1f"
+            ),
+            "Altitude (km)": st.column_config.NumberColumn(
+                "Altitude (km)",
+                help="Current orbital altitude. GEO nominal: 35,786 km. Graveyard orbit: >35,986 km",
+                format="%.1f"
+            ),
+            "Drift Status": st.column_config.TextColumn(
+                "Drift Status",
+                help="GSO: <0.05°/day ideal | IGSO: <2°/day normal",
+                width="medium"
+            )
+        }
     )
     
-    with st.expander("📋 View Detailed Health Remarks"):
+    with st.expander("📋 View Detailed Health Remarks & Pattern Analysis"):
         for _, row in health_df.iterrows():
             st.markdown(f"### {row['Satellite']} ({row['Type']}) - {row['Health Status']}")
             st.markdown(f"**Overall Score:** {row['Overall Score']}/100")
-            st.markdown("**Remarks:**")
+            
+            # Pattern Analysis Details
+            st.markdown("#### 📊 Maneuver Pattern Analysis")
+            st.markdown(f"**Analysis Period:** {row.get('Pattern Analysis Period', 'N/A')}")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**E-W Maneuvers (Drift Correction):**")
+                st.markdown(f"- Total: {row['EW Maneuvers']}")
+                st.markdown(f"- Expected Interval: {row.get('EW Expected Interval (days)', 'N/A')} days")
+                st.markdown(f"- Days Since Last: {row.get('EW Days Since Last', 'N/A')}")
+                st.markdown(f"- Pattern Confidence: {row.get('EW Pattern Confidence', 'N/A')}")
+            
+            with col2:
+                st.markdown("**N-S Maneuvers (Inclination Correction):**")
+                st.markdown(f"- Total: {row['NS Maneuvers']}")
+                st.markdown(f"- Expected Interval: {row.get('NS Expected Interval (days)', 'N/A')} days")
+                st.markdown(f"- Days Since Last: {row.get('NS Days Since Last', 'N/A')}")
+                st.markdown(f"- Pattern Confidence: {row.get('NS Pattern Confidence', 'N/A')}")
+            
+            st.markdown("#### 💬 Health Remarks:")
             for remark in row['Remarks'].split(' | '):
                 st.markdown(f"- {remark}")
             st.markdown("---")
@@ -288,7 +524,7 @@ if st.session_state.get('analysis_complete', False):
                 })
         
         drift_summary_df = pd.DataFrame(drift_summary)
-        st.dataframe(drift_summary_df, hide_index=True, use_container_width=True)
+        st.dataframe(drift_summary_df, hide_index=True, width='stretch')
         st.caption(f"**GSO Drift Tolerance:** ±{drift_tolerance_gso}°/day | Positive = Eastward, Negative = Westward")
     
     # Satellite Classification
@@ -315,13 +551,32 @@ if st.session_state.get('analysis_complete', False):
                 'Classified Type': sat_type
             })
         sat_summary_df = pd.DataFrame(sat_summary)
-        st.dataframe(sat_summary_df, hide_index=True, use_container_width=True)
+        st.dataframe(sat_summary_df, hide_index=True, width='stretch')
     
     # Maneuver Summary
     with st.expander("🛠️ Maneuver Detection Summary", expanded=False):
         maneuver_summary_df = pd.DataFrame(maneuver_summary)
         st.caption(f"Detection settings: Z-score ≥ {z_threshold}, SMA ≥ {sma_threshold} km, Inclination ≥ {inc_threshold}°, Window = {int(persist_window)}")
-        st.dataframe(maneuver_summary_df, hide_index=True, use_container_width=True)
+        st.dataframe(maneuver_summary_df, hide_index=True, width='stretch')
+        
+        # Add Pattern Analysis Table
+        st.markdown("#### 📊 Maneuver Pattern Analysis (Last 365 Days)")
+        pattern_summary = []
+        for _, row in health_df.iterrows():
+            pattern_summary.append({
+                'Satellite': row['Satellite'],
+                'E-W Expected Interval (days)': row.get('EW Expected Interval (days)', 'N/A'),
+                'E-W Days Since Last': row.get('EW Days Since Last', 'N/A'),
+                'E-W Confidence': row.get('EW Pattern Confidence', 'N/A'),
+                'N-S Expected Interval (days)': row.get('NS Expected Interval (days)', 'N/A'),
+                'N-S Days Since Last': row.get('NS Days Since Last', 'N/A'),
+                'N-S Confidence': row.get('NS Pattern Confidence', 'N/A'),
+                'Analysis Period': row.get('Pattern Analysis Period', 'N/A')
+            })
+        
+        pattern_summary_df = pd.DataFrame(pattern_summary)
+        st.dataframe(pattern_summary_df, hide_index=True, width='stretch')
+        st.caption("💡 **Pattern Analysis**: Based on last 365 days of data. E-W maneuvers correct longitudinal drift, N-S maneuvers correct inclination.")
     
     # ==================== DOP ANALYSIS (EXPANDABLE) ====================
     with st.expander("📡 Dilution of Precision (DOP) Analysis", expanded=False):
@@ -347,7 +602,7 @@ if st.session_state.get('analysis_complete', False):
                     
                     st.success(f"✅ Successfully loaded {len(satellites)} satellites for DOP calculations")
                     
-                    current_time = datetime.utcnow().replace(tzinfo=timezone.utc)
+                    current_time = datetime.now(timezone.utc)
                     st.caption(f"Calculation Time (UTC): {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
                     
                     dop_results = []
@@ -427,7 +682,7 @@ if st.session_state.get('analysis_complete', False):
                                 })
                     
                     dop_df = pd.DataFrame(dop_results)
-                    st.dataframe(dop_df, hide_index=True, use_container_width=True)
+                    st.dataframe(dop_df, hide_index=True, width='stretch')
                     
                     st.caption("**DOP Quality Guide:** Excellent: <2 | Good: 2-4 | Moderate: 4-6 | Fair: 6-8 | Poor: >8")
                     st.caption(f"Elevation mask: {elevation_mask_deg}°")
@@ -501,7 +756,26 @@ if st.session_state.get('analysis_complete', False):
                     )
                     loc_meta = {'name': sky_plot_name, 'lat': sky_plot_lat, 'lon': sky_plot_lon}
                     
-                    plot_sky_plot(satellites, sat_positions, loc_meta, elevation_mask)
+                    # Add toggle for animated vs static sky plot
+                    plot_type = st.radio(
+                        "Sky Plot Type",
+                        ["Static (Current Time)", "Animated (24 Hours)"],
+                        horizontal=True,
+                        help="Choose between a static snapshot or an animated view showing satellite movement over 24 hours"
+                    )
+                    
+                    if plot_type == "Static (Current Time)":
+                        plot_sky_plot(satellites, sat_positions, loc_meta, elevation_mask)
+                    else:
+                        # Animated sky plot
+                        plot_animated_sky_plot(
+                            satellites, 
+                            loc_meta, 
+                            current_time, 
+                            elevation_mask_deg=elevation_mask,
+                            duration_hours=24,
+                            time_step_minutes=15
+                        )
 
             # DOP Over Last 30 Days Plot
             if st.session_state.get('satellites_dop') and st.session_state.get('dop_results'):
@@ -558,6 +832,6 @@ else:
     **Understanding Drift:**
     - **Zero drift (0°/day)**: Perfect geostationary orbit
     - **Positive drift**: Satellite moving eastward (orbiting faster than Earth)
-    - **Negative drift**: Satellite moving westward (orbiting slower than Earth)
+    - ** Negative drift**: Satellite moving westward (orbiting slower than Earth)
     - **GSO tolerance**: Typically ±0.05°/day for good station-keeping
     """)

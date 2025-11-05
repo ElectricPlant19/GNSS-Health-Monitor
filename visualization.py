@@ -11,6 +11,8 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, timezone
 from config import INACTIVE_SATELLITES
 from dop_calculations import calculate_dop_for_location, calculate_bounding_boxes
+import folium
+from streamlit_folium import st_folium
 
 
 def plot_individual_satellites(df_all):
@@ -97,8 +99,8 @@ def plot_combined_drift(df_all, system_label="NavIC"):
 
 def plot_bounding_boxes(satellites, reference_time, timestep_minutes=15, prop_duration_days=1.5):
     """Plot satellite ground track bounding boxes."""
-    st.subheader("🗺️ Satellite Ground Track Bounding Boxes")
-    st.caption("Shows the geographic coverage area for each satellite over the next 1.5 days")
+    st.subheader("🗺️ Satellite Ground Tracks - All Satellites Combined")
+    st.caption("Shows the geographic coverage area for all satellites over the next 1.5 days")
     
     with st.spinner("Calculating satellite ground tracks..."):
         bounding_boxes = calculate_bounding_boxes(
@@ -109,128 +111,109 @@ def plot_bounding_boxes(satellites, reference_time, timestep_minutes=15, prop_du
         )
         
         if bounding_boxes:
-            for sat_name, box_data in bounding_boxes.items():
-                st.markdown(f"#### {sat_name} Ground Track")
-                
-                fig = go.Figure()
-                
-                fig.add_trace(go.Scattergeo(
-                    lon=box_data['longitudes'],
-                    lat=box_data['latitudes'],
-                    mode='lines+markers',
-                    name=sat_name,
-                    marker=dict(size=3),
-                    line=dict(width=2)
-                ))
-                
-                box_lons = [
-                    box_data['min_lon'], box_data['max_lon'], 
-                    box_data['max_lon'], box_data['min_lon'], 
-                    box_data['min_lon']
-                ]
-                box_lats = [
-                    box_data['min_lat'], box_data['min_lat'], 
-                    box_data['max_lat'], box_data['max_lat'], 
-                    box_data['min_lat']
-                ]
-                
-                fig.add_trace(go.Scattergeo(
-                    lon=box_lons,
-                    lat=box_lats,
-                    mode='lines',
-                    name='Bounding Box',
-                    line=dict(color='red', width=2, dash='dash')
-                ))
-                
-                fig.add_trace(go.Scattergeo(
-                    lon=[box_data['mean_lon']],
-                    lat=[box_data['mean_lat']],
-                    mode='markers',
-                    name='Center',
-                    marker=dict(size=10, color='red', symbol='x')
-                ))
-                
-                fig.update_geos(
-                    projection_type="natural earth",
-                    showland=True,
-                    landcolor="lightgray",
-                    showocean=True,
-                    oceancolor="lightblue",
-                    showcountries=True,
-                    countrycolor="white",
-                    showlakes=True,
-                    lakecolor="lightblue",
-                    center=dict(lon=box_data['mean_lon'], lat=box_data['mean_lat']),
-                    projection_scale=3
-                )
-                
-                fig.update_layout(
-                    title=f"{sat_name} - Geographic Coverage (1.5 days)",
-                    height=500,
-                    showlegend=True
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Longitude Range", 
-                             f"{box_data['min_lon']:.2f}° to {box_data['max_lon']:.2f}°")
-                with col2:
-                    st.metric("Latitude Range", 
-                             f"{box_data['min_lat']:.2f}° to {box_data['max_lat']:.2f}°")
-                with col3:
-                    st.metric("Center Position", 
-                             f"({box_data['mean_lat']:.2f}°, {box_data['mean_lon']:.2f}°)")
-                
-                st.markdown("---")
-            
+            # Only show combined ground tracks (removed individual satellite plots)
             plot_combined_ground_tracks(bounding_boxes)
         else:
             st.warning("No bounding box data available for plotting.")
 
 
 def plot_combined_ground_tracks(bounding_boxes, system_label="NavIC"):
-    """Plot combined ground tracks for all satellites."""
+    """Plot combined ground tracks for all satellites using Folium."""
     st.markdown("#### All Satellites - Combined Ground Tracks")
     
-    fig_combined = go.Figure()
+    # Define colors for different satellites
+    colors = ['blue', 'red', 'green', 'purple', 'orange', 'darkred', 'lightblue', 
+              'darkgreen', 'cadetblue', 'darkpurple', 'pink', 'lightgreen']
     
-    colors = ['#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3', '#FF6692']
+    # Calculate center of all tracks
+    all_lats = []
+    all_lons = []
+    for box_data in bounding_boxes.values():
+        all_lats.extend(box_data['latitudes'])
+        all_lons.extend(box_data['longitudes'])
     
+    center_lat = sum(all_lats) / len(all_lats) if all_lats else 20
+    center_lon = sum(all_lons) / len(all_lons) if all_lons else 80
+    
+    # Create Folium map centered on the average position
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=4,
+        tiles='OpenStreetMap',
+        control_scale=True
+    )
+    
+    # Add different tile layers
+    folium.TileLayer('CartoDB positron').add_to(m)
+    folium.TileLayer('CartoDB dark_matter').add_to(m)
+    
+    # Create a feature group for each satellite
     for idx, (sat_name, box_data) in enumerate(bounding_boxes.items()):
         color = colors[idx % len(colors)]
         
-        fig_combined.add_trace(go.Scattergeo(
-            lon=box_data['longitudes'],
-            lat=box_data['latitudes'],
-            mode='lines',
-            name=sat_name,
-            line=dict(width=2, color=color),
-            showlegend=True
-        ))
+        # Create coordinates list for the ground track
+        coordinates = list(zip(box_data['latitudes'], box_data['longitudes']))
+        
+        # Add the ground track as a polyline
+        folium.PolyLine(
+            coordinates,
+            color=color,
+            weight=3,
+            opacity=0.8,
+            popup=f"{sat_name} Ground Track",
+            tooltip=sat_name
+        ).add_to(m)
+        
+        # Add start marker
+        if coordinates:
+            folium.CircleMarker(
+                location=coordinates[0],
+                radius=5,
+                color=color,
+                fill=True,
+                fillColor=color,
+                fillOpacity=0.7,
+                popup=f"{sat_name} - Start",
+                tooltip=f"{sat_name} Start"
+            ).add_to(m)
+            
+            # Add end marker
+            folium.CircleMarker(
+                location=coordinates[-1],
+                radius=5,
+                color=color,
+                fill=True,
+                fillColor='white',
+                fillOpacity=0.7,
+                popup=f"{sat_name} - End",
+                tooltip=f"{sat_name} End"
+            ).add_to(m)
     
-    fig_combined.update_geos(
-        projection_type="natural earth",
-        showland=True,
-        landcolor="lightgray",
-        showocean=True,
-        oceancolor="lightblue",
-        showcountries=True,
-        countrycolor="white",
-        showlakes=True,
-        lakecolor="lightblue",
-        center=dict(lon=80, lat=20),
-        projection_scale=2
-    )
+    # Add layer control
+    folium.LayerControl().add_to(m)
     
-    fig_combined.update_layout(
-        title=f"All {system_label} Satellites - Combined Ground Tracks",
-        height=600,
-        showlegend=True
-    )
+    # Add title
+    title_html = f'''
+    <div style="position: fixed; 
+                top: 10px; 
+                left: 50px; 
+                width: 400px; 
+                height: 50px; 
+                background-color: white; 
+                border:2px solid grey; 
+                z-index:9999; 
+                font-size:16px;
+                padding: 10px;
+                border-radius: 5px;
+                box-shadow: 2px 2px 6px rgba(0,0,0,0.3);
+                ">
+    <b>{system_label} Satellites - Ground Tracks (1.5 days)</b>
+    </div>
+    '''
+    m.get_root().html.add_child(folium.Element(title_html))
     
-    st.plotly_chart(fig_combined, use_container_width=True)
+    # Display the map in Streamlit
+    st_folium(m, width=None, height=600, returned_objects=[])
 
 
 def plot_sky_plot(satellites, sat_positions, location_meta, elevation_mask_deg):
@@ -320,6 +303,260 @@ def plot_sky_plot(satellites, sat_positions, location_meta, elevation_mask_deg):
         
     else:
         st.info(f"No satellites above the {elevation_mask_deg}° elevation mask at this time for {location_meta['name']}.")
+
+
+def plot_animated_sky_plot(satellites, location_meta, start_time, elevation_mask_deg=5, duration_hours=24, time_step_minutes=15):
+    """
+    Create an animated azimuth-elevation sky plot showing satellite movement over time.
+    
+    Args:
+        satellites: Dictionary of satellite objects
+        location_meta: Dictionary with 'name', 'lat', 'lon'
+        start_time: Starting datetime for animation
+        elevation_mask_deg: Minimum elevation angle
+        duration_hours: Duration of animation in hours (default 24)
+        time_step_minutes: Time step between frames in minutes (default 15)
+    """
+    from skyfield.api import load, wgs84
+    
+    st.markdown("#### 🎬 Animated Sky Plot - 24 Hour Satellite Motion")
+    st.caption(f"Shows satellite movement over {duration_hours} hours at {location_meta['name']}")
+    
+    with st.spinner("Calculating satellite positions over time..."):
+        ts = load.timescale()
+        observer = wgs84.latlon(location_meta['lat'], location_meta['lon'])
+        
+        # Generate time steps
+        num_steps = int((duration_hours * 60) / time_step_minutes)
+        time_steps = []
+        for i in range(num_steps):
+            dt = start_time + timedelta(minutes=i * time_step_minutes)
+            time_steps.append(dt)
+        
+        # Calculate positions for all satellites at all time steps
+        frames_data = []
+        
+        for time_idx, current_time in enumerate(time_steps):
+            t = ts.from_datetime(current_time)
+            
+            frame_az = []
+            frame_r = []
+            frame_names = []
+            frame_elev = []
+            frame_hover = []
+            
+            for sat_name, sat_obj in satellites.items():
+                try:
+                    difference = sat_obj - observer
+                    topocentric = difference.at(t)
+                    alt, az, distance = topocentric.altaz()
+                    
+                    elevation = alt.degrees
+                    azimuth = az.degrees
+                    
+                    if elevation > elevation_mask_deg:
+                        frame_az.append(azimuth)
+                        frame_r.append(max(0, 90 - elevation))
+                        frame_names.append(sat_name)
+                        frame_elev.append(elevation)
+                        frame_hover.append(
+                            f"<b>{sat_name}</b><br>" +
+                            f"Time: {current_time.strftime('%H:%M UTC')}<br>" +
+                            f"Azimuth: {azimuth:.1f}°<br>" +
+                            f"Elevation: {elevation:.1f}°<br>" +
+                            f"Distance: {distance.km:.0f} km"
+                        )
+                except Exception:
+                    continue
+            
+            frames_data.append({
+                'time': current_time,
+                'time_str': current_time.strftime('%Y-%m-%d %H:%M UTC'),
+                'az': frame_az,
+                'r': frame_r,
+                'names': frame_names,
+                'elev': frame_elev,
+                'hover': frame_hover,
+                'count': len(frame_names)
+            })
+        
+        # Create animated figure
+        fig = go.Figure()
+        
+        # Add initial frame
+        if frames_data and frames_data[0]['count'] > 0:
+            initial = frames_data[0]
+            fig.add_trace(go.Scatterpolar(
+                r=initial['r'],
+                theta=initial['az'],
+                mode='markers+text',
+                text=initial['names'],
+                textposition='top center',
+                hovertext=initial['hover'],
+                hoverinfo='text',
+                marker=dict(
+                    size=12,
+                    color=initial['elev'],
+                    colorscale='Viridis',
+                    showscale=True,
+                    colorbar=dict(
+                        title="Elevation (°)",
+                        thickness=15,
+                        len=0.7
+                    ),
+                    line=dict(width=1, color='white'),
+                    cmin=elevation_mask_deg,
+                    cmax=90
+                ),
+                textfont=dict(size=9),
+                name='Satellites'
+            ))
+        
+        # Create frames for animation
+        frames = []
+        for frame_data in frames_data:
+            if frame_data['count'] > 0:
+                frames.append(go.Frame(
+                    data=[go.Scatterpolar(
+                        r=frame_data['r'],
+                        theta=frame_data['az'],
+                        mode='markers+text',
+                        text=frame_data['names'],
+                        textposition='top center',
+                        hovertext=frame_data['hover'],
+                        hoverinfo='text',
+                        marker=dict(
+                            size=12,
+                            color=frame_data['elev'],
+                            colorscale='Viridis',
+                            showscale=True,
+                            colorbar=dict(
+                                title="Elevation (°)",
+                                thickness=15,
+                                len=0.7
+                            ),
+                            line=dict(width=1, color='white'),
+                            cmin=elevation_mask_deg,
+                            cmax=90
+                        ),
+                        textfont=dict(size=9)
+                    )],
+                    name=frame_data['time_str'],
+                    layout=go.Layout(
+                        title=dict(
+                            text=f"Sky Plot at {location_meta['name']}<br>" +
+                                 f"<sub>Time: {frame_data['time_str']} | " +
+                                 f"Visible: {frame_data['count']} satellites | " +
+                                 f"Elevation mask: {elevation_mask_deg}°</sub>"
+                        )
+                    )
+                ))
+        
+        fig.frames = frames
+        
+        # Update layout with animation controls
+        fig.update_layout(
+            title=dict(
+                text=f"Sky Plot at {location_meta['name']}<br>" +
+                     f"<sub>Time: {frames_data[0]['time_str']} | " +
+                     f"Visible: {frames_data[0]['count']} satellites | " +
+                     f"Elevation mask: {elevation_mask_deg}°</sub>",
+                x=0.5,
+                xanchor='center'
+            ),
+            polar=dict(
+                radialaxis=dict(
+                    range=[0, 90],
+                    tickvals=[0, 30, 60, 90],
+                    ticktext=['Zenith (90°)', '60°', '30°', f'Horizon ({elevation_mask_deg}°)'],
+                    showline=True,
+                    linewidth=2
+                ),
+                angularaxis=dict(
+                    direction='clockwise',
+                    rotation=90,
+                    tickvals=[0, 45, 90, 135, 180, 225, 270, 315],
+                    ticktext=['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+                ),
+                bgcolor='rgba(240, 240, 240, 0.3)'
+            ),
+            showlegend=False,
+            height=700,
+            margin=dict(t=100, b=40),
+            updatemenus=[{
+                'type': 'buttons',
+                'showactive': False,
+                'buttons': [
+                    {
+                        'label': '▶ Play',
+                        'method': 'animate',
+                        'args': [None, {
+                            'frame': {'duration': 500, 'redraw': True},
+                            'fromcurrent': True,
+                            'mode': 'immediate',
+                            'transition': {'duration': 300, 'easing': 'quadratic-in-out'}
+                        }]
+                    },
+                    {
+                        'label': '⏸ Pause',
+                        'method': 'animate',
+                        'args': [[None], {
+                            'frame': {'duration': 0, 'redraw': False},
+                            'mode': 'immediate',
+                            'transition': {'duration': 0}
+                        }]
+                    }
+                ],
+                'direction': 'left',
+                'pad': {'r': 10, 't': 87},
+                'x': 0.1,
+                'xanchor': 'left',
+                'y': 0,
+                'yanchor': 'top'
+            }],
+            sliders=[{
+                'active': 0,
+                'yanchor': 'top',
+                'y': 0,
+                'xanchor': 'left',
+                'currentvalue': {
+                    'prefix': 'Time: ',
+                    'visible': True,
+                    'xanchor': 'right'
+                },
+                'pad': {'b': 10, 't': 50},
+                'len': 0.9,
+                'x': 0.1,
+                'steps': [
+                    {
+                        'args': [[f.name], {
+                            'frame': {'duration': 300, 'redraw': True},
+                            'mode': 'immediate',
+                            'transition': {'duration': 300}
+                        }],
+                        'method': 'animate',
+                        'label': f.name.split(' ')[1] if ' ' in f.name else f.name
+                    }
+                    for f in frames
+                ]
+            }]
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Add summary statistics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            avg_visible = sum(f['count'] for f in frames_data) / len(frames_data)
+            st.metric("Average Visible Satellites", f"{avg_visible:.1f}")
+        with col2:
+            max_visible = max(f['count'] for f in frames_data)
+            st.metric("Maximum Visible", f"{max_visible}")
+        with col3:
+            min_visible = min(f['count'] for f in frames_data)
+            st.metric("Minimum Visible", f"{min_visible}")
+        
+        st.caption(f"**Animation Details:** {num_steps} frames over {duration_hours} hours (1 frame every {time_step_minutes} minutes)")
 
 
 def plot_dop_over_time(satellites, use_custom_location, custom_lat, custom_lon, 
