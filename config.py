@@ -8,6 +8,12 @@ MU = 398600.4418  # km^3/s^2
 R_EARTH = 6371.0  # km
 GEOSYNC_MEAN_MOTION = 1.002737909  # revolutions/day for perfect geostationary orbit
 
+# Orbital altitude thresholds (km)
+GEO_NOMINAL_ALTITUDE = 35786.0  # Nominal GEO altitude (km)
+GEO_ALTITUDE_TOLERANCE = 100.0  # Normal operational tolerance (±100 km)
+GRAVEYARD_ORBIT_THRESHOLD = 36000.0  # Altitude above which satellite is likely in graveyard orbit
+GRAVEYARD_ORBIT_MIN = 35986.0  # Minimum graveyard orbit altitude (GEO + 200 km)
+
 # NavIC Satellite NORAD IDs
 NAVIK_SATS = {
     "IRNSS-1B": 39635,
